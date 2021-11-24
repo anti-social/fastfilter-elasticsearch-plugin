@@ -21,7 +21,13 @@
 package org.elasticsearch.lsena.fastfilter;
 
 import org.apache.lucene.index.LeafReaderContext;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.fielddata.IndexFieldData;
+import org.elasticsearch.index.fielddata.IndexNumericFieldData;
+import org.elasticsearch.index.mapper.MappedFieldType;
+import org.elasticsearch.index.mapper.NumberFieldMapper;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.ScriptPlugin;
 import org.elasticsearch.script.FilterScript;
@@ -70,7 +76,7 @@ public class FastFilterPlugin extends Plugin implements ScriptPlugin {
 				ScriptContext<T> context,
 				Map<String, String> params
 				) {
-			if (context.equals(FilterScript.CONTEXT) == false) {
+			if (!context.equals(FilterScript.CONTEXT)) {
 				throw new IllegalArgumentException(getType()
 						+ " scripts cannot be used for context ["
 						+ context.name + "]");
@@ -110,6 +116,15 @@ public class FastFilterPlugin extends Plugin implements ScriptPlugin {
 					Map<String, Object> params,
 					SearchLookup lookup
 					) {
+				if (!params.containsKey("field")) {
+					throw new IllegalArgumentException(
+						"Missing parameter [field]");
+				}
+				if (!params.containsKey("terms")) {
+					throw new IllegalArgumentException(
+						"Missing parameter [terms]");
+				}
+
 				final byte[] decodedTerms = Base64.getDecoder().decode(params.get("terms").toString());
 				final ByteBuffer buffer = ByteBuffer.wrap(decodedTerms);
 				RoaringBitmap rBitmap = new RoaringBitmap();
@@ -117,72 +132,86 @@ public class FastFilterPlugin extends Plugin implements ScriptPlugin {
 					rBitmap.deserialize(buffer);
 				}
 				catch (IOException e) {
-					// Do something here
+					throw ExceptionsHelper.convertToElastic(e);
 				}
-				// FastFilterLeafFactory leafFactory = new FastFilterLeafFactory(params, lookup, rBitmap);
-				return new FastFilterLeafFactory(params, lookup, rBitmap);
+
+				Object operation = params.get("operation");
+				String opType = "include";
+				if (operation != null) {
+					opType = operation.toString();
+				}
+				switch (opType) {
+					case "include":
+						return new FastFilterLeafFactory(params, lookup, rBitmap, true);
+					case "exclude":
+						return new FastFilterLeafFactory(params, lookup, rBitmap, false);
+					default:
+						throw new IllegalStateException("Unreacable");
+				}
 			}
 		}
 
 		private static class FastFilterLeafFactory implements LeafFactory {
 			private final Map<String, Object> params;
 			private final SearchLookup lookup;
-			private final String fieldName;
-			private final String opType;
-			private final String terms;
+			private final IndexFieldData<?> fieldData;
 			private final RoaringBitmap rBitmap;
+			private final boolean found;
+			private final boolean notFound;
 
-			private FastFilterLeafFactory(Map<String, Object> params, SearchLookup lookup, RoaringBitmap rBitmap) {
-				if (params.containsKey("field") == false) {
-					throw new IllegalArgumentException(
-							"Missing parameter [field]");
-				}
-				if (params.containsKey("terms") == false) {
-					throw new IllegalArgumentException(
-							"Missing parameter [terms]");
-				}
+			private FastFilterLeafFactory(
+				Map<String, Object> params, SearchLookup lookup, RoaringBitmap rBitmap, boolean include
+			) {
 				this.params = params;
 				this.lookup = lookup;
 				this.rBitmap = rBitmap;
-				opType = params.get("operation").toString();
-				fieldName = params.get("field").toString();
-				terms = params.get("terms").toString();
+				this.found = include;
+				this.notFound = !found;
+
+				String fieldName = params.get("field").toString();
+				MappedFieldType fieldType = lookup.fieldType(fieldName);
+				if (!fieldType.hasDocValues()) {
+					throw new ElasticsearchException("Required doc values for field: " + fieldName);
+				}
+
+				if (!(fieldType instanceof NumberFieldMapper.NumberFieldType)) {
+					throw new ElasticsearchException("Field " + fieldName + " must be of integer numeric type");
+				}
+				IndexNumericFieldData.NumericType numericType =
+					((NumberFieldMapper.NumberFieldType) fieldType).numericType();
+				if (numericType.isFloatingPoint()) {
+					throw new ElasticsearchException("Field " + fieldName + " must be of integer numeric type");
+				}
+				fieldData = lookup.getForField(fieldType);
 			}
 
-
 			@Override
-			public FilterScript newInstance(LeafReaderContext context) throws IOException {
+			public FilterScript newInstance(LeafReaderContext context) {
+				ScriptDocValues.Longs scriptValues = (ScriptDocValues.Longs) fieldData.load(context).getScriptValues();
+
 				return new FilterScript(params, lookup, context) {
+					@Override
+					public void setDocument(int docid) {
+						super.setDocument(docid);
+						try {
+							scriptValues.setNextDocId(docid);
+						} catch (IOException e) {
+							throw ExceptionsHelper.convertToElastic(e);
+						}
+					}
 
 					@Override
 					public boolean execute() {
-						try {
-
-							final int docId;
-							if (fieldName.equals("_id")) {
-								final ScriptDocValues.Strings fieldNameValue = 
-										(ScriptDocValues.Strings)getDoc().get(fieldName);
-								docId = Integer.parseInt(fieldNameValue.getValue());	
-							} else {
-								// TODO: there must be a better way to do this
-								// we do not need the whole doc, just the value
-								// TODO2: the selected field could be a string and this will explode
-								final ScriptDocValues.Longs fieldNameValue = 
-										(ScriptDocValues.Longs)getDoc().get(fieldName);
-								docId = (int)fieldNameValue.getValue();	
-							}
-
-							if (opType.equals("exclude") && rBitmap.contains(docId)) {
-								return false;
-							}
-							else if (opType.equals("include") && !rBitmap.contains(docId)) {
-								return false;
-							}
-							return true;
-
-						} catch (Exception exception) {
-							throw exception;
+						if (scriptValues.size() == 0) {
+							return notFound;
 						}
+						for (Long scriptValue : scriptValues) {
+							int value = Math.toIntExact(scriptValue);
+							if (rBitmap.contains(value)) {
+								return found;
+							}
+						}
+						return notFound;
 					}
 				};
 			}

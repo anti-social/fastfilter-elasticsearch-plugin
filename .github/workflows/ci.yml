@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "master"
+      - "faster"
       - "6.x"
   pull_request:
     branches:
@@ -11,8 +12,8 @@ on:
       - "6.x"
 
 env:
-  gradle-version: "6.8.3"
-  java-version: "14"
+  gradle-version: "7.2"
+  java-version: "16"
 
 jobs:
   build:
